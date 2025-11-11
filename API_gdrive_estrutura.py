@@ -7,6 +7,9 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 import snowflake.connector
 from snowflake.connector import connect
+from snowflake.snowpark import Session 
+from snowflake.snowpark.exceptions import SnowparkSQLException 
+
 
 load_dotenv('ignore.env') 
 
@@ -22,7 +25,6 @@ DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly'] 
 
 SNOWFLAKE_STAGE_NAME = f'@{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.PDF_FILES_STAGE' 
-
 TEMP_UPLOAD_DIR = 'temp_drive_files'
 
 
@@ -36,13 +38,12 @@ def download_files_from_drive():
         )
         service = build('drive', 'v3', credentials=creds)
     except Exception as e:
-        print(f"ERROR DE AUTENTICACIÓN DE DRIVE: Revise GOOGLE_SERVICE_ACCOUNT_PATH y permisos. {e}")
+        print(f"ERROR DE AUTENTICACIÓN DE DRIVE: {e}")
         return []
 
     print(f"Buscando archivos en Drive ID: {DRIVE_FOLDER_ID}...")
 
     query = f"'{DRIVE_FOLDER_ID}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed=false"
-    
     results = service.files().list(q=query, fields='files(id, name)').execute()
     items = results.get('files', [])
 
@@ -54,57 +55,93 @@ def download_files_from_drive():
     os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
     
     for item in items:
-        file_id = item['id']
-        file_name = item['name']
+        file_id, file_name = item['id'], item['name']
         local_path = os.path.join(TEMP_UPLOAD_DIR, file_name)
-
         
-        request = service.files().get_media(fileId=file_id)
-        file_handle = io.FileIO(local_path, 'wb')
-        downloader = MediaIoBaseDownload(file_handle, request)
-        
-        done = False
-        while done is False:
-            status, done = downloader.next_chunk()
+        try:
+            request = service.files().get_media(fileId=file_id)
+            file_handle = io.FileIO(local_path, 'wb')
+            downloader = MediaIoBaseDownload(file_handle, request)
             
-        downloaded_files_count += 1
-        
+            done = False
+            while done is False:
+                status, done = downloader.next_chunk()
+            downloaded_files_count += 1
+        except Exception as download_err:
+            print(f"ERROR: No se pudo descargar {file_name}. Error: {download_err}")
+            continue
+            
     return os.listdir(TEMP_UPLOAD_DIR)
 
 
-
 def upload_to_snowflake(file_names):
-    """Sube archivos al Stage de Snowflake usando el comando PUT."""
+    """Sube archivos al Stage de Snowflake usando el comando PUT y llama al SP."""
     if not file_names:
-        return
+        return False
 
     try:
         conn = connect(
-            user=SNOWFLAKE_USER,
-            password=SNOWFLAKE_PASSWORD,
-            account=SNOWFLAKE_ACCOUNT,
-            warehouse=SNOWFLAKE_WAREHOUSE,
-            database=SNOWFLAKE_DATABASE,
-            schema=SNOWFLAKE_SCHEMA
+            user=SNOWFLAKE_USER, password=SNOWFLAKE_PASSWORD, account=SNOWFLAKE_ACCOUNT,
+            warehouse=SNOWFLAKE_WAREHOUSE, database=SNOWFLAKE_DATABASE, schema=SNOWFLAKE_SCHEMA
         )
         cursor = conn.cursor()
     except Exception as e:
-        print(f"ERROR DE CONEXIÓN A SNOWFLAKE: Revise credenciales de Snowflake en .env. {e}")
-        return
+        print(f"ERROR DE CONEXIÓN A SNOWFLAKE: {e}")
+        return False
 
     try:
-        print(f"\nSubiendo archivos al Stage: {SNOWFLAKE_STAGE_NAME}...")
-        
         put_command = f"PUT file://{TEMP_UPLOAD_DIR}/* {SNOWFLAKE_STAGE_NAME} AUTO_COMPRESS=TRUE OVERWRITE=TRUE"
-        
         cursor.execute(put_command)
-
+        print("Carga PUT finalizada. Inicia el procesamiento interno...")
+        
+        cursor.execute(f"CALL NETFLIX.NET_MOVIES.P_GDRIVE_TO_CORE_LOADER('{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}');")
+        print("Llamada al SP de procesamiento interno completada.")
+        
     except Exception as e:
-        print(f"ERROR EN LA CARGA PUT A SNOWFLAKE: {e}")
+        print(f"ERROR EN LA CARGA PUT O LLAMADA AL SP: {e}")
 
     finally:
-        if 'conn' in locals() and conn:
-            conn.close()
+        if conn: conn.close()
+    return True
+
+
+
+def transform_data(session: Session, tabla_destino: str):
+    """
+    Función de transformación ejecutada DENTRO del Stored Procedure de Snowflake (HANDLER).
+    Procesa los archivos que ya están en el Stage.
+    """
+    
+    stage_path = f'@NETFLIX.NET_MOVIES.PDF_FILES_STAGE' 
+    
+    try: 
+        print(f"Iniciando transformación interna en destino: {tabla_destino}")
+        
+        session.sql(f"""
+            COPY INTO NETFLIX.NET_MOVIES.RAW_CSV_DATA
+            FROM {stage_path}
+            FILE_FORMAT = (TYPE = CSV, SKIP_HEADER = 1)
+            PATTERN = '.*[.]csv$'
+            ON_ERROR = 'CONTINUE';
+        """).collect()
+        
+        session.sql(f"""
+            INSERT INTO NETFLIX.NET_MOVIES.RAW_PDF_TEXT (FILE_NAME, RAW_CONTENT)
+            SELECT
+                T.RELATIVE_PATH AS FILE_NAME,
+                SNOWFLAKE.CORTEX.PARSE_DOCUMENT('{stage_path}', T.RELATIVE_PATH)
+            FROM
+                DIRECTORY('{stage_path}') AS T
+            WHERE
+                T.RELATIVE_PATH LIKE '%.pdf';
+        """).collect()
+        
+        return f"Transformación interna con Cortex AI completada para el destino: {tabla_destino}"
+    
+    except SnowparkSQLException as e:
+        return f"Error de procesamiento Snowpark/SQL: {e.message}"
+    except Exception as e:
+        return f"Error inesperado en transform_data: {e}"
 
 
 
